@@ -4,11 +4,12 @@ from datetime import datetime,timezone
 from pathlib import Path
 from typing import Any
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI,HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from atlas_client import heartbeat_worker
-APP_VERSION='0.5.0';NODE_ID=os.getenv('UNG_EDGE_NODE_ID',socket.gethostname());DATA_DIR=Path(os.getenv('UNG_EDGE_DATA_DIR',str(Path.home()/'ung-edge'/'data')));DB_PATH=DATA_DIR/'edge.db';NEXUS_URL=os.getenv('UNG_NEXUS_URL','').rstrip('/');PULSAR_URL=os.getenv('UNG_PULSAR_URL','https://ung-pulsar-production.up.railway.app').rstrip('/');SERVICE_TOKEN=os.getenv('UNG_EDGE_SERVICE_TOKEN','');SYNC_INTERVAL=int(os.getenv('UNG_EDGE_SYNC_INTERVAL_SECONDS','15'));STARTED=time.time();ATLAS_STATE={'atlas_connected':False,'atlas_last_error':None,'atlas_last_heartbeat':None};app=FastAPI(title='UNG-EDGE',version=APP_VERSION)
+from zipper_client import zipper_validate,zipper_resolve,ugamap_zipper,ZIPPER_URL,UGAMAP_URL
+APP_VERSION='0.6.0';NODE_ID=os.getenv('UNG_EDGE_NODE_ID',socket.gethostname());DATA_DIR=Path(os.getenv('UNG_EDGE_DATA_DIR',str(Path.home()/'ung-edge'/'data')));DB_PATH=DATA_DIR/'edge.db';NEXUS_URL=os.getenv('UNG_NEXUS_URL','').rstrip('/');PULSAR_URL=os.getenv('UNG_PULSAR_URL','https://ung-pulsar-production.up.railway.app').rstrip('/');SERVICE_TOKEN=os.getenv('UNG_EDGE_SERVICE_TOKEN','');SYNC_INTERVAL=int(os.getenv('UNG_EDGE_SYNC_INTERVAL_SECONDS','15'));STARTED=time.time();ATLAS_STATE={'atlas_connected':False,'atlas_last_error':None,'atlas_last_heartbeat':None};app=FastAPI(title='UNG-EDGE',version=APP_VERSION)
 class EventIn(BaseModel):topic:str;payload:dict[str,Any];priority:int=5;target_system:str='UNG-ATLAS'
 def utcnow():return datetime.now(timezone.utc).isoformat()
 def db():
@@ -49,7 +50,7 @@ async def probe(url):
   async with httpx.AsyncClient(timeout=5) as client:r=await client.get(url+'/health',headers=headers())
   return {'configured':True,'reachable':r.status_code<500,'status_code':r.status_code}
  except Exception as e:return {'configured':True,'reachable':False,'error':str(e)[:120]}
-async def connectivity():return {'nexus':await probe(NEXUS_URL),'pulsar':await probe(PULSAR_URL)}
+async def connectivity():return {'nexus':await probe(NEXUS_URL),'pulsar':await probe(PULSAR_URL),'zipper':await probe(ZIPPER_URL),'ugamap':await probe(UGAMAP_URL)}
 def metrics():
  c=db();q=c.execute('SELECT COUNT(*) n FROM outbound_queue WHERE delivered_at IS NULL').fetchone()['n'];retry=c.execute('SELECT COUNT(*) n FROM outbound_queue WHERE delivered_at IS NULL AND attempts>0').fetchone()['n'];sent=c.execute('SELECT COUNT(*) n FROM outbound_queue WHERE delivered_at IS NOT NULL').fetchone()['n'];events=c.execute('SELECT COUNT(*) n FROM local_events').fetchone()['n'];c.close();d=os.statvfs('/');temp=None
  try:temp=round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text())/1000,1)
@@ -70,8 +71,20 @@ def health():return {'ok':True,**metrics()}
 def status():return metrics()
 @app.get('/v1/control/status')
 async def control_status():m=metrics();m.update(await connectivity());return m
+@app.get('/v1/zipper/validate/{code}')
+async def edge_zipper_validate(code:str):
+ try:return await zipper_validate(code,headers())
+ except httpx.HTTPStatusError as e:raise HTTPException(status_code=e.response.status_code,detail='ZIPPER request failed')
+@app.get('/v1/zipper/{code}')
+async def edge_zipper_resolve(code:str):
+ try:return await zipper_resolve(code,headers())
+ except httpx.HTTPStatusError as e:raise HTTPException(status_code=e.response.status_code,detail='ZIP code not found')
+@app.get('/v1/ugamap/zipper')
+async def edge_ugamap_zipper():
+ try:return await ugamap_zipper(headers())
+ except httpx.HTTPStatusError as e:raise HTTPException(status_code=e.response.status_code,detail='UGAMAP geography request failed')
 @app.get('/control',response_class=HTMLResponse)
-def control():return HTMLResponse('''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>UNG-EDGE Control Center</title><style>body{font-family:Arial;background:#07111f;color:#eef;margin:0;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card,.flow{background:#101f33;border:1px solid #29415f;border-radius:12px;padding:16px}.big{font-size:28px;font-weight:bold}.ok{color:#42e68b}.bad{color:#ff6b6b}.muted{color:#9db0c7}</style></head><body><h1>UNG-EDGE Control Center</h1><div id=node class=muted>Loading...</div><div class=flow id=flow></div><div class=grid id=cards></div><script>function s(v){return v?'<span class=ok>● CONNECTED</span>':'<span class=bad>● NOT READY</span>'}async function load(){try{let d=await(await fetch('/v1/control/status')).json();node.textContent=d.node_id+' • v'+d.version;flow.innerHTML=`EDGE-001 ${s(true)} → JANUS ${s(d.janus)} → NEXUS ${s(d.nexus.reachable)} → PULSAR ${s(d.pulsar.reachable)} → ATLAS ${s(d.atlas_connected)}`;cards.innerHTML=`<div class=card>Uptime<div class=big>${Math.floor(d.uptime_seconds/60)} min</div></div><div class=card>Temperature<div class=big>${d.temperature_c??'—'}°C</div></div><div class=card>Events<div class=big>${d.events}</div></div><div class=card>Queued<div class=big>${d.queued}</div></div><div class=card>Delivered<div class=big>${d.delivered}</div></div><div class=card>Retrying<div class=big>${d.retrying}</div></div><div class=card>ATLAS Heartbeat<div>${s(d.atlas_connected)}</div><small>${d.atlas_last_heartbeat??''}</small></div>`}catch(e){flow.innerHTML='<span class=bad>● NODE UNREACHABLE</span>'}}load();setInterval(load,5000)</script></body></html>''')
+def control():return HTMLResponse('''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>UNG-EDGE Control Center</title><style>body{font-family:Arial;background:#07111f;color:#eef;margin:0;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card,.flow{background:#101f33;border:1px solid #29415f;border-radius:12px;padding:16px}.big{font-size:28px;font-weight:bold}.ok{color:#42e68b}.bad{color:#ff6b6b}.muted{color:#9db0c7}</style></head><body><h1>UNG-EDGE Control Center</h1><div id=node class=muted>Loading...</div><div class=flow id=flow></div><div class=grid id=cards></div><script>function s(v){return v?'<span class=ok>● CONNECTED</span>':'<span class=bad>● NOT READY</span>'}async function load(){try{let d=await(await fetch('/v1/control/status')).json();node.textContent=d.node_id+' • v'+d.version;flow.innerHTML=`EDGE-001 ${s(true)} → ZIPPER ${s(d.zipper.reachable)} → UGAMAP ${s(d.ugamap.reachable)} → JANUS ${s(d.janus)} → NEXUS ${s(d.nexus.reachable)} → PULSAR ${s(d.pulsar.reachable)} → ATLAS ${s(d.atlas_connected)}`;cards.innerHTML=`<div class=card>Uptime<div class=big>${Math.floor(d.uptime_seconds/60)} min</div></div><div class=card>Temperature<div class=big>${d.temperature_c??'—'}°C</div></div><div class=card>Events<div class=big>${d.events}</div></div><div class=card>Queued<div class=big>${d.queued}</div></div><div class=card>Delivered<div class=big>${d.delivered}</div></div><div class=card>Retrying<div class=big>${d.retrying}</div></div><div class=card>ATLAS Heartbeat<div>${s(d.atlas_connected)}</div><small>${d.atlas_last_heartbeat??''}</small></div>`}catch(e){flow.innerHTML='<span class=bad>● NODE UNREACHABLE</span>'}}load();setInterval(load,5000)</script></body></html>''')
 @app.post('/v1/events')
 def ingest(e:EventIn):
  eid=str(uuid.uuid4());now=utcnow();p=json.dumps(e.payload,separators=(',',':'));c=db();c.execute('INSERT INTO local_events VALUES(?,?,?,?)',(eid,e.topic,p,now));c.execute('INSERT INTO outbound_queue(id,topic,payload,priority,created_at,target_system) VALUES(?,?,?,?,?,?)',(eid,e.topic,p,e.priority,now,e.target_system));c.commit();c.close();return {'accepted':True,'event_id':eid,'queued':True,'target_system':e.target_system}
