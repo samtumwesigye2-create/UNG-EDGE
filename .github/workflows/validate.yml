@@ -1,0 +1,32 @@
+name: Validate UNG-EDGE
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m venv venv
+      - run: venv/bin/pip install -r requirements.txt
+      - run: venv/bin/python -m py_compile app.py
+      - name: Start runtime
+        run: |
+          mkdir -p "$HOME/ung-edge/data"
+          UNG_EDGE_NODE_ID=ung-edge-ci UNG_EDGE_DATA_DIR="$HOME/ung-edge/data" venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8080 >edge.log 2>&1 &
+          echo $! > edge.pid
+      - name: Health acceptance
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8080/health | tee health.json; then exit 0; fi
+            sleep 1
+          done
+          cat edge.log
+          exit 1
+      - name: Status acceptance
+        run: curl -fsS http://127.0.0.1:8080/v1/status
